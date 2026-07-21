@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = ["core", "service"]
+
+# Standalone home of the ZKas merchant payment gateway. The two crates that come
+# from the node workspace — `kaspa-addresses` (address encoding, runtime) and
+# `kaspa-shielded-core` (FVK helpers, tests only) — are pulled as git
+# dependencies on firecash-rusty so this repo can never drift from the chain's
+# address/keys format. Everything else is crates.io.
+[workspace.package]
+version = "2.0.1"
+edition = "2024"
+rust-version = "1.91.0"
+authors = ["ZKas developers"]
+license = "ISC"
+repository = "https://github.com/firecash/zkas-payment-gateway"
+
+[workspace.lints.clippy]
+empty_docs = "allow"
+uninlined_format_args = "allow"
+
+[workspace.dependencies]
+# Intra-chain crates, pinned to firecash-rusty so the gateway shares the exact
+# address/keys encoding the node and wallet use.
+kaspa-addresses = { git = "https://github.com/firecash/firecash-rusty", branch = "main" }
+kaspa-shielded-core = { git = "https://github.com/firecash/firecash-rusty", branch = "main" }
+
+# Local member.
+zkas-payment-gateway = { version = "2.0.1", path = "core" }
+
+# crates.io — versions match the node workspace to keep a single resolved graph.
+hex = { version = "0.4.3", features = ["serde"] }
+hmac = { version = "0.12.1", default-features = false }
+rand = "0.8.5"
+serde = { version = "1.0.190", features = ["derive", "rc", "alloc"], default-features = false }
+serde_json = "1.0.107"
+sha2 = { version = "0.10.8", default-features = false }
+tokio = { version = "1.42.1", features = ["sync"] }
+
+# Release profile knobs the node workspace applies to the heavy Halo2 crates
+# `kaspa-shielded-core` pulls in — kept so a release build of the gateway (and
+# its tests) matches the node's optimized proving/verifying code.
+[profile.release.package.halo2_proofs]
+opt-level = 3
+[profile.release.package.halo2_gadgets]
+opt-level = 3
+[profile.release.package.pasta_curves]
+opt-level = 3
+[profile.release.package.orchard]
+opt-level = 3
