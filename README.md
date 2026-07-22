@@ -22,7 +22,7 @@ cargo test  -p zkas-payment-gateway     # the invoice state-machine core
 
 The two chain crates it needs — `kaspa-addresses` (address encoding, runtime)
 and `kaspa-shielded-core` (FVK helpers, tests only) — are git dependencies on
-[`firecash-rusty`](https://github.com/firecash/firecash-rusty), so the gateway
+[`firecash-rusty`](https://github.com/firecash/zkas-rusty), so the gateway
 always shares the node's exact address/keys format and can never drift from it.
 Everything else is crates.io. Building against a private `firecash-rusty` needs
 git credentials for that repo (e.g. a `url."https://TOKEN@github.com/".insteadOf`

@@ -22,8 +22,8 @@ uninlined_format_args = "allow"
 [workspace.dependencies]
 # Intra-chain crates, pinned to firecash-rusty so the gateway shares the exact
 # address/keys encoding the node and wallet use.
-kaspa-addresses = { git = "https://github.com/firecash/firecash-rusty", branch = "main" }
-kaspa-shielded-core = { git = "https://github.com/firecash/firecash-rusty", branch = "main" }
+kaspa-addresses = { git = "https://github.com/firecash/zkas-rusty", branch = "main" }
+kaspa-shielded-core = { git = "https://github.com/firecash/zkas-rusty", branch = "main" }
 
 # Local member.
 zkas-payment-gateway = { version = "2.0.1", path = "core" }
