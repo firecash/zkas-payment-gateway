@@ -1453,7 +1453,7 @@ dependencies = [
 [[package]]
 name = "kaspa-addresses"
 version = "2.0.1"
-source = "git+https://github.com/firecash/firecash-rusty?branch=main#d8a5a661aa9570c227d0499eab74654a644c0f04"
+source = "git+https://github.com/firecash/zkas-rusty?branch=main#d8a5a661aa9570c227d0499eab74654a644c0f04"
 dependencies = [
  "borsh",
  "js-sys",
@@ -1468,7 +1468,7 @@ dependencies = [
 [[package]]
 name = "kaspa-shielded-core"
 version = "2.0.1"
-source = "git+https://github.com/firecash/firecash-rusty?branch=main#d8a5a661aa9570c227d0499eab74654a644c0f04"
+source = "git+https://github.com/firecash/zkas-rusty?branch=main#d8a5a661aa9570c227d0499eab74654a644c0f04"
 dependencies = [
  "blake2b_simd",
  "group",
