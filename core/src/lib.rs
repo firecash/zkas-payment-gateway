@@ -96,10 +96,47 @@ pub enum GatewayError {
     InvalidViewingKey,
     InvalidAmount,
     InvalidExpiry,
+    InvalidConfirmations,
+    InvalidText,
+    InvalidRedirectUrl,
+    MetadataTooLarge,
     DiversifierExhausted,
     UnknownInvoice,
     AddressMismatch,
     AmountOverflow,
+}
+
+/// Longest invoice lifetime accepted: 30 days. Anything longer keeps state
+/// (and a live address) around with no realistic checkout behind it.
+pub const MAX_EXPIRY_SECS: u64 = 30 * 24 * 3_600;
+/// Largest confirmation distance accepted: ~10 days of blue scores.
+pub const MAX_REQUIRED_BLUE_SCORE: u64 = 100_000;
+/// Free-text fields (order id, keys, metadata) stay small so one request
+/// cannot bloat the state file.
+pub const MAX_TEXT_LEN: usize = 256;
+pub const MAX_METADATA_ENTRIES: usize = 16;
+
+fn validate_text(what: &str, value: &str) -> Result<(), GatewayError> {
+    if value.is_empty() || value.len() > MAX_TEXT_LEN || value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(GatewayError::InvalidText);
+    }
+    let _ = what;
+    Ok(())
+}
+
+/// Redirect targets stay on https or on this site. Anything else (javascript:,
+/// data:, foreign http) would turn the checkout page into a redirector.
+fn validate_redirect_url(url: &str) -> Result<(), GatewayError> {
+    if url.len() > 2_048 {
+        return Err(GatewayError::InvalidRedirectUrl);
+    }
+    if url.starts_with('/') && !url.starts_with("//") {
+        return Ok(());
+    }
+    if url.starts_with("https://") && !url.contains([' ', '\t', '\n', '\r']) {
+        return Ok(());
+    }
+    Err(GatewayError::InvalidRedirectUrl)
 }
 
 impl core::fmt::Display for GatewayError {
@@ -139,13 +176,31 @@ impl Gateway {
         if request.amount_sompi == 0 {
             return Err(GatewayError::InvalidAmount);
         }
-        if request.expires_in == 0 {
+        if request.expires_in == 0 || request.expires_in > MAX_EXPIRY_SECS {
             return Err(GatewayError::InvalidExpiry);
         }
+        // A zero distance confirms instantly, which no merchant wants by
+        // accident. An absurd one never confirms. Both are rejected here
+        // rather than trusted to the caller's UI defaults.
+        if request.required_blue_score == 0 || request.required_blue_score > MAX_REQUIRED_BLUE_SCORE {
+            return Err(GatewayError::InvalidConfirmations);
+        }
+        validate_text("order_id", &request.order_id)?;
         if let Some(key) = request.idempotency_key.as_ref() {
+            validate_text("idempotency_key", key)?;
             if let Some(id) = self.idempotency.get(key) {
                 return Ok(self.invoices[id].clone());
             }
+        }
+        if request.metadata.len() > MAX_METADATA_ENTRIES {
+            return Err(GatewayError::MetadataTooLarge);
+        }
+        for (key, value) in &request.metadata {
+            validate_text("metadata key", key)?;
+            validate_text("metadata value", value)?;
+        }
+        if let Some(url) = request.redirect_url.as_ref() {
+            validate_redirect_url(url)?;
         }
         let index = self.next_diversifier;
         self.next_diversifier = self.next_diversifier.checked_add(1).ok_or(GatewayError::DiversifierExhausted)?;
@@ -243,6 +298,11 @@ impl Gateway {
         let mut events = Vec::new();
         for invoice in self.invoices.values_mut() {
             let old = invoice.status;
+            // PaidLate needs a person to look at it (wrong amount? wrong time?),
+            // so the background pass never moves it on its own.
+            if old == InvoiceStatus::PaidLate {
+                continue;
+            }
             if invoice.paid_sompi == 0 && now >= invoice.expires_at {
                 invoice.status = InvoiceStatus::Expired;
             } else if invoice.paid_sompi >= invoice.amount_sompi {
@@ -260,11 +320,14 @@ fn payment_status(invoice: &Invoice, sink_blue_score: u64) -> InvoiceStatus {
     if invoice.paid_sompi < invoice.amount_sompi {
         return InvoiceStatus::Partial;
     }
-    if invoice.paid_sompi > invoice.amount_sompi {
-        return InvoiceStatus::Overpaid;
-    }
     let confirmed =
         invoice.payments.iter().all(|payment| sink_blue_score.saturating_sub(payment.blue_score) >= invoice.required_blue_score);
+    // Extra money still has to sit through the same confirmations before it
+    // counts: an unconfirmed overpayment is just a Paid invoice with more in
+    // it, not a final state the merchant should act on.
+    if invoice.paid_sompi > invoice.amount_sompi {
+        return if confirmed { InvoiceStatus::Overpaid } else { InvoiceStatus::Paid };
+    }
     if confirmed { InvoiceStatus::Confirmed } else { InvoiceStatus::Paid }
 }
 
@@ -299,6 +362,36 @@ pub fn verify_webhook(secret: &[u8], signature: &str, body: &[u8], now: u64, tol
     mac.update(b".");
     mac.update(body);
     mac.verify_slice(&digest).is_ok()
+}
+
+/// Remembers webhook deliveries a receiver already acted on, so a captured
+/// webhook replayed inside its timestamp window is ignored the second time.
+/// Merchants validating webhooks should keep one of these beside the secret
+/// and call [`WebhookReplayCache::check`] after [`verify_webhook`] passes.
+#[derive(Clone, Debug, Default)]
+pub struct WebhookReplayCache {
+    seen: HashMap<String, u64>,
+}
+
+impl WebhookReplayCache {
+    /// How many deliveries are remembered before the oldest are dropped.
+    pub const CAPACITY: usize = 1_024;
+
+    /// Returns false when this exact delivery was already seen (a replay).
+    /// Entries older than `tolerance` seconds are forgotten on each call.
+    pub fn check(&mut self, signature: &str, now: u64, tolerance: u64) -> bool {
+        self.seen.retain(|_, at| now.saturating_sub(*at) <= tolerance);
+        if self.seen.contains_key(signature) {
+            return false;
+        }
+        if self.seen.len() >= Self::CAPACITY {
+            if let Some(oldest) = self.seen.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.seen.insert(signature.to_owned(), now);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +448,53 @@ mod tests {
         assert!(verify_webhook(b"secret", &signature, body, 1_010, 30));
         assert!(!verify_webhook(b"wrong", &signature, body, 1_010, 30));
         assert!(!verify_webhook(b"secret", &signature, body, 2_000, 30));
+    }
+
+    #[test]
+    fn replayed_webhooks_are_ignored_once_seen() {
+        let body = br#"{"type":"invoice.confirmed"}"#;
+        let signature = sign_webhook(b"secret", 1_000, body);
+        let mut cache = WebhookReplayCache::default();
+        assert!(cache.check(&signature, 1_010, 300));
+        assert!(!cache.check(&signature, 1_020, 300), "same delivery twice is a replay");
+        assert!(cache.check(&signature, 2_000, 300), "entries older than the window are forgotten");
+    }
+
+    #[test]
+    fn overpaid_needs_confirmations_and_late_needs_review() {
+        let mut gateway = gateway();
+        let invoice = gateway.create_invoice(request(None)).unwrap();
+        let raw: [u8; 43] = Address::try_from(invoice.address.as_str()).unwrap().payload.as_slice().try_into().unwrap();
+        // 150 of 100 asked, but no depth yet: Paid, not a final state.
+        gateway.observe_payment(raw, [9; 32], 150, 100, 100, 100, 1_100).unwrap();
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Paid);
+        gateway.advance(1_100, 115);
+        assert_eq!(gateway.invoice(&invoice.id).unwrap().status, InvoiceStatus::Overpaid);
+        // A payment after expiry needs a person: PaidLate, and the background
+        // pass must not move it on its own.
+        let late = gateway.create_invoice(request(None)).unwrap();
+        let late_raw: [u8; 43] = Address::try_from(late.address.as_str()).unwrap().payload.as_slice().try_into().unwrap();
+        gateway.observe_payment(late_raw, [8; 32], 100, 10, 10, 500, 9_999_999).unwrap();
+        assert_eq!(gateway.invoice(&late.id).unwrap().status, InvoiceStatus::PaidLate);
+        gateway.advance(9_999_999, 9_999_999);
+        assert_eq!(gateway.invoice(&late.id).unwrap().status, InvoiceStatus::PaidLate);
+    }
+
+    #[test]
+    fn invoice_inputs_are_bounded() {
+        let mut gateway = gateway();
+        let mut bad = request(None);
+        bad.required_blue_score = 0;
+        assert!(gateway.create_invoice(bad).is_err());
+        let mut bad = request(None);
+        bad.order_id = "x".repeat(300);
+        assert!(gateway.create_invoice(bad).is_err());
+        let mut bad = request(None);
+        bad.redirect_url = Some("javascript:alert(1)".into());
+        assert!(gateway.create_invoice(bad).is_err());
+        let mut bad = request(None);
+        bad.redirect_url = Some("https://merchant.example/thanks".into());
+        assert!(gateway.create_invoice(bad).is_ok());
     }
 
     #[test]

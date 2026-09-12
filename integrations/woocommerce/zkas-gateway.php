@@ -38,8 +38,15 @@ add_action('plugins_loaded', function () {
 
         public function process_payment($order_id) {
             $order = wc_get_order($order_id);
-            $rate = (float) $this->get_option('rate', '1');
-            $sompi = (string) max(1, (int) round(((float) $order->get_total()) * $rate * 100000000));
+            // Decimal string math, never float: (float) totals like 19.99 cannot
+            // be represented exactly, and a 1-sompi rounding the wrong way bills
+            // the wrong amount. total x rate x 10^8 computed on digit strings.
+            $sompi = self::sompi_from_decimal((string) $order->get_total(), (string) $this->get_option('rate', '1'));
+            if ($sompi === null) {
+                wc_add_notice('The ZKAS payment service is temporarily unavailable.', 'error');
+                return array('result' => 'failure');
+            }
+            $sompi = (string) max(1, (int) $sompi);
             $body = array(
                 'orderId' => (string) $order_id,
                 'amountSompi' => $sompi,
@@ -72,6 +79,72 @@ add_action('plugins_loaded', function () {
             wc_reduce_stock_levels($order_id);
             return array('result' => 'success', 'redirect' => esc_url_raw($invoice['checkoutUrl']));
         }
+
+        /**
+         * Multiply two non-negative decimal strings and shift by 10^8,
+         * truncating any fraction of a sompi down. Pure digit-string math so
+         * float rounding can never bill a sompi more or less. Returns null
+         * when either side is not a plain decimal number.
+         */
+        public static function sompi_from_decimal($total, $rate) {
+            $to_parts = function ($s) {
+                $s = trim((string) $s);
+                if (!preg_match('/^\d+(\.\d{0,8})?$/', $s)) return null;
+                $dot = strpos($s, '.');
+                if ($dot === false) return array($s, 0);
+                return array(str_replace('.', '', $s), strlen($s) - $dot - 1);
+            };
+            $t = $to_parts($total);
+            $r = $to_parts($rate);
+            if ($t === null || $r === null) return null;
+            if (function_exists('bcmul')) {
+                $product = bcmul($t[0], $r[0], 0);
+                $shift = $t[1] + $r[1];
+                if ($shift < 8) return $product . str_repeat('0', 8 - $shift);
+                if ($shift === 8) return $product;
+                $cut = strlen($product) - ($shift - 8);
+                return $cut > 0 ? substr($product, 0, $cut) : '0';
+            }
+            // No bcmath: schoolbook multiply on digit strings.
+            $mul = function ($a, $b) {
+                $res = '0';
+                $blen = strlen($b);
+                for ($i = $blen - 1, $pow = 0; $i >= 0; $i--, $pow++) {
+                    $digit = (int) $b[$i];
+                    if ($digit === 0) continue;
+                    $carry = 0;
+                    $row = '';
+                    for ($j = strlen($a) - 1; $j >= 0; $j--) {
+                        $tmp = ((int) $a[$j]) * $digit + $carry;
+                        $row = (string) ($tmp % 10) . $row;
+                        $carry = (int) ($tmp / 10);
+                    }
+                    if ($carry) $row = (string) $carry . $row;
+                    $row .= str_repeat('0', $pow);
+                    $res = self::str_add($res, $row);
+                }
+                return $res;
+            };
+            $product = $mul(ltrim($t[0], '0') === '' ? '0' : ltrim($t[0], '0'), ltrim($r[0], '0') === '' ? '0' : ltrim($r[0], '0'));
+            $shift = $t[1] + $r[1];
+            if ($shift < 8) return $product . str_repeat('0', 8 - $shift);
+            if ($shift === 8) return $product;
+            $cut = strlen($product) - ($shift - 8);
+            return $cut > 0 ? substr($product, 0, $cut) : '0';
+        }
+
+        private static function str_add($a, $b) {
+            $i = strlen($a) - 1;
+            $j = strlen($b) - 1;
+            $carry = 0;
+            $out = '';
+            while ($i >= 0 || $j >= 0 || $carry) {
+                $sum = $carry + ($i >= 0 ? (int) $a[$i--] : 0) + ($j >= 0 ? (int) $b[$j--] : 0);
+                $out = (string) ($sum % 10) . $out;
+                $carry = (int) ($sum / 10);
+            }
+            return ltrim($out, '0') === '' ? '0' : ltrim($out, '0');
+        }
     }
 
     add_filter('woocommerce_payment_gateways', function ($methods) {
@@ -97,6 +170,18 @@ add_action('rest_api_init', function () {
             $order_id = $invoice['orderId'] ?? null;
             $order = $order_id ? wc_get_order($order_id) : null;
             if (!$order || $order->get_meta('_zkas_invoice_id') !== ($invoice['id'] ?? '')) return new WP_REST_Response(null, 202);
+            // A captured webhook stays valid for its whole timestamp window, so
+            // remember acted-on event ids per order and ignore repeats. Without
+            // this the same delivery processed twice could trigger duplicate
+            // fulfilment actions downstream.
+            $event_id = is_string($event['id'] ?? null) ? $event['id'] : '';
+            if ($event_id === '') return new WP_REST_Response(null, 202);
+            $seen = $order->get_meta('_zkas_webhook_events');
+            if (!is_array($seen)) $seen = array();
+            if (in_array($event_id, $seen, true)) return new WP_REST_Response(null, 200);
+            $seen[] = $event_id;
+            $order->update_meta_data('_zkas_webhook_events', array_slice($seen, -20));
+            $order->save();
             if (in_array($invoice['status'] ?? '', array('confirmed', 'overpaid'), true) && !$order->is_paid()) {
                 $tx = $invoice['payments'][0]['transactionId'] ?? 'ZKAS';
                 if (is_array($tx)) $tx = implode('', array_map(function ($byte) { return sprintf('%02x', $byte); }, $tx));
