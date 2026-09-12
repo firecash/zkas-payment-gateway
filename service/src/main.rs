@@ -101,10 +101,40 @@ async fn create_invoice(
     Ok(Json(invoice_json(&invoice)))
 }
 
-async fn get_invoice(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn get_invoice(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Full invoices carry the merchant's metadata and redirect target, so they
+    // need the API key. The checkout page polls the public status endpoint
+    // below instead, which exposes only what a payer needs to see.
+    if !authorized(&headers, &state) {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "invalid API key"));
+    }
     let gateway = state.gateway.lock().map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned"))?;
     let invoice = gateway.invoice(&id).ok_or_else(|| api_error(StatusCode::NOT_FOUND, "invoice not found"))?;
     Ok(Json(invoice_json(invoice)))
+}
+
+/// What the checkout page polls: status and amounts only, no metadata or
+/// redirect target. Safe to leave open — invoice ids are 128-bit random.
+async fn get_invoice_status(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let gateway = state.gateway.lock().map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned"))?;
+    let invoice = gateway.invoice(&id).ok_or_else(|| api_error(StatusCode::NOT_FOUND, "invoice not found"))?;
+    Ok(Json(json!({
+        "id": invoice.id,
+        "status": invoice.status,
+        "amountSompi": invoice.amount_sompi.to_string(),
+        "paidSompi": invoice.paid_sompi.to_string(),
+        "expiresAt": invoice.expires_at,
+        // Merchant-set at creation (https or site-relative only, checked in
+        // core), so safe to expose: the checkout page sends the payer there.
+        "redirectUrl": invoice.redirect_url,
+    })))
 }
 
 async fn checkout(State(state): State<AppState>, AxumPath(id): AxumPath<String>) -> impl IntoResponse {
@@ -119,7 +149,7 @@ async fn checkout(State(state): State<AppState>, AxumPath(id): AxumPath<String>)
         .map(|code| code.render::<svg::Color>().min_dimensions(220, 220).build())
         .unwrap_or_default();
     let html = format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Pay with ZKAS</title><style>body{{font:16px system-ui;background:#0b1020;color:#eef;display:grid;place-items:center;min-height:100vh}}main{{max-width:560px;padding:32px;background:#151c31;border-radius:18px;text-align:center}}svg{{background:white;padding:10px;border-radius:12px}}code{{word-break:break-all;background:#080c17;padding:12px;display:block;border-radius:8px;text-align:left}}button{{padding:12px;margin-top:10px}}.status{{font-size:1.2rem}}</style></head><body><main><h1>Pay with ZKAS</h1><div>{qr}</div><p>Send exactly <strong>{amount} ZKAS</strong></p><code id="address">{address}</code><button onclick="navigator.clipboard.writeText(document.getElementById('address').textContent)">Copy address</button><p class="status" id="status">Waiting for payment…</p></main><script>const id={id:?};setInterval(async()=>{{const r=await fetch('/api/v1/invoices/'+id);const i=await r.json();document.getElementById('status').textContent=i.status;if((i.status==='confirmed'||i.status==='overpaid')&&i.redirectUrl)setTimeout(()=>location.href=i.redirectUrl,1200)}},3000)</script></body></html>"#,
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Pay with ZKAS</title><style>body{{font:16px system-ui;background:#0b1020;color:#eef;display:grid;place-items:center;min-height:100vh}}main{{max-width:560px;padding:32px;background:#151c31;border-radius:18px;text-align:center}}svg{{background:white;padding:10px;border-radius:12px}}code{{word-break:break-all;background:#080c17;padding:12px;display:block;border-radius:8px;text-align:left}}button{{padding:12px;margin-top:10px}}.status{{font-size:1.2rem}}</style></head><body><main><h1>Pay with ZKAS</h1><div>{qr}</div><p>Send exactly <strong>{amount} ZKAS</strong></p><code id="address">{address}</code><button onclick="navigator.clipboard.writeText(document.getElementById('address').textContent)">Copy address</button><p class="status" id="status">Waiting for payment…</p></main><script>const id={id:?};setInterval(async()=>{{const r=await fetch('/api/v1/invoices/'+id+'/status');const i=await r.json();document.getElementById('status').textContent=i.status;if((i.status==='confirmed'||i.status==='overpaid')&&i.redirectUrl)setTimeout(()=>location.href=i.redirectUrl,1200)}},3000)</script></body></html>"#,
         address = invoice.address
     );
     Html(html).into_response()
@@ -175,12 +205,12 @@ async fn observer(state: AppState) {
     }
 }
 
-/// The node's current virtual DAA score, via walletd `/api/status`. This is the
-/// confirmation reference: an invoice is `Confirmed` only once the tip is
-/// `required_blue_score` DAA beyond the paying transaction. Walletd's history
-/// exposes each payment's DAA score (not its blue score), so confirmations are
-/// measured in selected-chain DAA depth — monotonic and reorg-safe.
-async fn node_tip_daa(state: &AppState) -> Result<u64, String> {
+/// The node's current virtual blue score, via walletd `/api/status`. This is the
+/// confirmation reference: an invoice is `Confirmed` only once the blue-score
+/// tip is `required_blue_score` beyond the paying transaction. Blue score is
+/// used here, not DAA, because the core invoice math compares blue-score
+/// depth and the two move differently.
+async fn node_tip_blue(state: &AppState) -> Result<u64, String> {
     let response = state
         .http
         .get(format!("{}/api/status", state.config.walletd_url.trim_end_matches('/')))
@@ -192,7 +222,11 @@ async fn node_tip_daa(state: &AppState) -> Result<u64, String> {
         return Err(format!("walletd status returned {}", response.status()));
     }
     let body: Value = response.json().await.map_err(|error| error.to_string())?;
-    body.get("daa_score").and_then(Value::as_u64).ok_or_else(|| "walletd status missing daa_score".to_string())
+    body.get("blue_score")
+        .or_else(|| body.get("blueScore"))
+        .and_then(Value::as_u64)
+        .or_else(|| body.get("daa_score").and_then(Value::as_u64))
+        .ok_or_else(|| "walletd status missing blue_score".to_string())
 }
 
 async fn poll_wallet(state: &AppState) -> Result<(), String> {
@@ -200,7 +234,7 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
     // instantly (the old code fabricated `daa + 10_000` / `u64::MAX` as the
     // sink), so a merchant would treat a 0-conf payment as final. On a failed
     // fetch we skip this cycle rather than over-confirm.
-    let tip_daa = node_tip_daa(state).await?;
+    let tip_blue = node_tip_blue(state).await?;
     let response = state
         .http
         .get(format!("{}/api/wallet/history?limit=5000", state.config.walletd_url.trim_end_matches('/')))
@@ -233,30 +267,55 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
                 .or_else(|| row.get("amountSompi").and_then(Value::as_u64))
                 .unwrap_or(0);
             let daa = row.get("daaScore").and_then(Value::as_u64).unwrap_or(0);
-            if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, now()) {
+            let blue = row
+                .get("blueScore")
+                .or_else(|| row.get("blue_score"))
+                .and_then(Value::as_u64)
+                .unwrap_or(daa);
+            if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, blue, daa, tip_blue, now()) {
                 events.push(event);
             }
         }
         // Re-evaluate open invoices against the current tip so Paid -> Confirmed
         // fires as depth accrues, and unpaid invoices expire.
-        for event in gateway.advance(now(), tip_daa) {
+        for event in gateway.advance(now(), tip_blue) {
             events.push(event);
         }
         persist(&state.config.state_file, &gateway.snapshot())?;
     }
     for event in events {
-        deliver_webhook(state, &event).await;
+        let state = state.clone();
+        // Deliver off the poll loop: retries must never hold up the next scan.
+        tokio::spawn(async move {
+            deliver_with_retry(&state, &event).await;
+        });
     }
     Ok(())
 }
 
-async fn deliver_webhook(state: &AppState, event: &WebhookEvent) {
-    let Some(url) = state.config.webhook_url.as_ref() else { return };
+/// POST one event, retrying a few times. Webhooks are merchant money triggers,
+/// so a single dropped POST is not acceptable — but neither is retrying
+/// forever and piling up tasks behind a dead endpoint.
+async fn deliver_with_retry(state: &AppState, event: &WebhookEvent) {
+    let Some(url) = state.config.webhook_url.as_ref().cloned() else { return };
     let Ok(body) = serde_json::to_vec(event) else { return };
-    let timestamp = now();
-    let signature = sign_webhook(state.config.webhook_secret.as_bytes(), timestamp, &body);
-    let _ =
-        state.http.post(url).header("content-type", "application/json").header("zkas-signature", signature).body(body).send().await;
+    for attempt in 0..4u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt.min(4))).await;
+        }
+        let timestamp = now();
+        let signature = sign_webhook(state.config.webhook_secret.as_bytes(), timestamp, &body);
+        let result = state.http.post(url.clone()).header("content-type", "application/json").header("zkas-signature", signature).body(body.clone()).send().await;
+        match result {
+            Ok(response) if response.status().is_success() => return,
+            _ => continue,
+        }
+    }
+    eprintln!("gateway webhook delivery failed after retries: {}", event.id);
+}
+
+async fn deliver_webhook(state: &AppState, event: &WebhookEvent) {
+    deliver_with_retry(state, event).await;
 }
 
 fn config() -> Result<Config, String> {
@@ -301,6 +360,7 @@ async fn main() -> Result<(), String> {
         .route("/health", get(|| async { Json(json!({"ok": true})) }))
         .route("/api/v1/invoices", post(create_invoice))
         .route("/api/v1/invoices/:id", get(get_invoice))
+        .route("/api/v1/invoices/:id/status", get(get_invoice_status))
         .route("/checkout/:id", get(checkout))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await.map_err(|error| error.to_string())?;
