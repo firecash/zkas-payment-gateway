@@ -175,12 +175,12 @@ async fn observer(state: AppState) {
     }
 }
 
-/// The node's current virtual DAA score, via walletd `/api/status`. This is the
-/// confirmation reference: an invoice is `Confirmed` only once the tip is
-/// `required_blue_score` DAA beyond the paying transaction. Walletd's history
-/// exposes each payment's DAA score (not its blue score), so confirmations are
-/// measured in selected-chain DAA depth — monotonic and reorg-safe.
-async fn node_tip_daa(state: &AppState) -> Result<u64, String> {
+/// The node's current virtual blue score, via walletd `/api/status`. This is the
+/// confirmation reference: an invoice is `Confirmed` only once the blue-score
+/// tip is `required_blue_score` beyond the paying transaction. Blue score is
+/// used here, not DAA, because the core invoice math compares blue-score
+/// depth and the two move differently.
+async fn node_tip_blue(state: &AppState) -> Result<u64, String> {
     let response = state
         .http
         .get(format!("{}/api/status", state.config.walletd_url.trim_end_matches('/')))
@@ -192,7 +192,11 @@ async fn node_tip_daa(state: &AppState) -> Result<u64, String> {
         return Err(format!("walletd status returned {}", response.status()));
     }
     let body: Value = response.json().await.map_err(|error| error.to_string())?;
-    body.get("daa_score").and_then(Value::as_u64).ok_or_else(|| "walletd status missing daa_score".to_string())
+    body.get("blue_score")
+        .or_else(|| body.get("blueScore"))
+        .and_then(Value::as_u64)
+        .or_else(|| body.get("daa_score").and_then(Value::as_u64))
+        .ok_or_else(|| "walletd status missing blue_score".to_string())
 }
 
 async fn poll_wallet(state: &AppState) -> Result<(), String> {
@@ -200,7 +204,7 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
     // instantly (the old code fabricated `daa + 10_000` / `u64::MAX` as the
     // sink), so a merchant would treat a 0-conf payment as final. On a failed
     // fetch we skip this cycle rather than over-confirm.
-    let tip_daa = node_tip_daa(state).await?;
+    let tip_blue = node_tip_blue(state).await?;
     let response = state
         .http
         .get(format!("{}/api/wallet/history?limit=5000", state.config.walletd_url.trim_end_matches('/')))
@@ -233,13 +237,18 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
                 .or_else(|| row.get("amountSompi").and_then(Value::as_u64))
                 .unwrap_or(0);
             let daa = row.get("daaScore").and_then(Value::as_u64).unwrap_or(0);
-            if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, now()) {
+            let blue = row
+                .get("blueScore")
+                .or_else(|| row.get("blue_score"))
+                .and_then(Value::as_u64)
+                .unwrap_or(daa);
+            if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, blue, daa, tip_blue, now()) {
                 events.push(event);
             }
         }
         // Re-evaluate open invoices against the current tip so Paid -> Confirmed
         // fires as depth accrues, and unpaid invoices expire.
-        for event in gateway.advance(now(), tip_daa) {
+        for event in gateway.advance(now(), tip_blue) {
             events.push(event);
         }
         persist(&state.config.state_file, &gateway.snapshot())?;
