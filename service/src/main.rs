@@ -119,7 +119,7 @@ async fn checkout(State(state): State<AppState>, AxumPath(id): AxumPath<String>)
         .map(|code| code.render::<svg::Color>().min_dimensions(220, 220).build())
         .unwrap_or_default();
     let html = format!(
-        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Pay with ZKAS</title><style>body{{font:16px system-ui;background:#0b1020;color:#eef;display:grid;place-items:center;min-height:100vh}}main{{max-width:560px;padding:32px;background:#151c31;border-radius:18px;text-align:center}}svg{{background:white;padding:10px;border-radius:12px}}code{{word-break:break-all;background:#080c17;padding:12px;display:block;border-radius:8px;text-align:left}}button{{padding:12px;margin-top:10px}}.status{{font-size:1.2rem}}</style></head><body><main><h1>Pay with ZKAS</h1><div>{qr}</div><p>Send exactly <strong>{amount} ZKAS</strong></p><code id="address">{address}</code><button onclick="navigator.clipboard.writeText(document.getElementById('address').textContent)">Copy address</button><p class="status" id="status">Waiting for payment…</p></main><script>const id={id:?};setInterval(async()=>{{const r=await fetch('/api/v1/invoices/'+id);const i=await r.json();document.getElementById('status').textContent=i.status;if((i.status==='confirmed'||i.status==='overpaid')&&i.redirectUrl)setTimeout(()=>location.href=i.redirectUrl,1200)}},3000)</script></body></html>"#,
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Pay with ZKAS</title><style>body{{font:16px system-ui;background:#0b1020;color:#eef;display:grid;place-items:center;min-height:100vh}}main{{max-width:560px;padding:32px;background:#151c31;border-radius:18px;text-align:center}}svg{{background:white;padding:10px;border-radius:12px}}code{{word-break:break-all;background:#080c17;padding:12px;display:block;border-radius:8px;text-align:left}}button{{padding:12px;margin-top:10px}}.status{{font-size:1.2rem}}.eta{{margin:18px 0 0;color:#8e96ab;font-size:.78rem}}</style></head><body><main><h1>Pay with ZKAS</h1><div>{qr}</div><p>Send exactly <strong>{amount} ZKAS</strong></p><code id="address">{address}</code><button onclick="navigator.clipboard.writeText(document.getElementById('address').textContent)">Copy address</button><p class="status" id="status">Waiting for payment…</p><p class="eta">After payment is detected, credit usually appears within 2–3 minutes.</p></main><script>const id={id:?};setInterval(async()=>{{const r=await fetch('/api/v1/invoices/'+id);const i=await r.json();document.getElementById('status').textContent=i.status;if((i.status==='confirmed'||i.status==='overpaid')&&i.redirectUrl)setTimeout(()=>location.href=i.redirectUrl,1200)}},3000)</script></body></html>"#,
         address = invoice.address
     );
     Html(html).into_response()
@@ -201,6 +201,31 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
     // sink), so a merchant would treat a 0-conf payment as final. On a failed
     // fetch we skip this cycle rather than over-confirm.
     let tip_daa = node_tip_daa(state).await?;
+    // This fast path is additive. A temporary endpoint failure must never stop
+    // the settled-history path that has always been the final source of truth.
+    let pending_body: Value = match state
+        .http
+        .get(format!("{}/api/wallet/pending-receipts", state.config.walletd_url.trim_end_matches('/')))
+        .header("x-wallet-token", &state.config.wallet_token)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => match response.json().await {
+            Ok(body) => body,
+            Err(error) => {
+                eprintln!("gateway pending-receipt decode: {error}");
+                Value::Null
+            }
+        },
+        Ok(response) => {
+            eprintln!("gateway pending receipts returned {}", response.status());
+            Value::Null
+        }
+        Err(error) => {
+            eprintln!("gateway pending receipts: {error}");
+            Value::Null
+        }
+    };
     let response = state
         .http
         .get(format!("{}/api/wallet/history?limit=5000", state.config.walletd_url.trim_end_matches('/')))
@@ -215,6 +240,34 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
     let mut events = Vec::new();
     {
         let mut gateway = state.gateway.lock().map_err(|_| "state lock poisoned")?;
+        // Near-tip receipts are already decrypted from selected-chain blocks but
+        // intentionally are not in settled wallet history for ~200 blue scores.
+        // Require ten DAA of continuous chain inclusion before observing them;
+        // a receipt reorged out before then simply disappears and is never credited.
+        for row in pending_body.get("rows").and_then(Value::as_array).into_iter().flatten() {
+            let Some(daa) = row.get("daaScore").and_then(Value::as_u64) else { continue };
+            if tip_daa.saturating_sub(daa) < 10 {
+                continue;
+            }
+            let Some(recipient) = row.get("recipient").and_then(Value::as_str) else { continue };
+            let Ok(address) = Address::try_from(recipient) else { continue };
+            let Ok(raw) = <[u8; 43]>::try_from(address.payload.as_slice()) else { continue };
+            let Some(txid) = row
+                .get("txid")
+                .and_then(Value::as_str)
+                .and_then(|v| hex::decode(v).ok())
+                .and_then(|v| v.try_into().ok())
+            else {
+                continue;
+            };
+            let Some(amount) = row.get("amountSompiExact").and_then(Value::as_str).and_then(|v| v.parse().ok()) else { continue };
+            if amount == 0 {
+                continue;
+            }
+            if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, now()) {
+                events.push(event);
+            }
+        }
         for row in body.get("rows").and_then(Value::as_array).into_iter().flatten() {
             if row.get("kind").and_then(Value::as_str) != Some("received") {
                 continue;
@@ -232,6 +285,9 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
                 .and_then(|v| v.parse().ok())
                 .or_else(|| row.get("amountSompi").and_then(Value::as_u64))
                 .unwrap_or(0);
+            if amount == 0 {
+                continue;
+            }
             let daa = row.get("daaScore").and_then(Value::as_u64).unwrap_or(0);
             if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, now()) {
                 events.push(event);
@@ -295,7 +351,11 @@ async fn main() -> Result<(), String> {
         }
         Err(error) => return Err(error.to_string()),
     };
-    let state = AppState { config: config.clone(), gateway: Arc::new(Mutex::new(gateway)), http: reqwest::Client::new() };
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let state = AppState { config: config.clone(), gateway: Arc::new(Mutex::new(gateway)), http };
     tokio::spawn(observer(state.clone()));
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({"ok": true})) }))
