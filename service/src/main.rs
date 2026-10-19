@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -60,12 +60,26 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Jso
     (status, Json(json!({ "error": message.into() })))
 }
 
+/// Length-checked, difference-accumulating comparison. `==` on `str` short-circuits at the first
+/// differing byte, which turns the merchant API key into a timing oracle; this leaks only the
+/// length. Not worth a new dependency, but not worth leaving either.
+fn secret_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn authorized(headers: &HeaderMap, state: &AppState) -> bool {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|key| key == state.config.api_key)
+        .is_some_and(|key| secret_eq(key.as_bytes(), state.config.api_key.as_bytes()))
 }
 
 async fn create_invoice(
@@ -180,7 +194,10 @@ async fn observer(state: AppState) {
 /// `required_blue_score` DAA beyond the paying transaction. Walletd's history
 /// exposes each payment's DAA score (not its blue score), so confirmations are
 /// measured in selected-chain DAA depth — monotonic and reorg-safe.
-async fn node_tip_daa(state: &AppState) -> Result<u64, String> {
+/// The node tip as walletd reports it, and whether walletd's view is complete enough to judge a
+/// payment's absence (synced and not reloading). A zero tip is no tip: walletd reports it while
+/// it starts, and using it would make every payment shallow.
+async fn node_tip_daa(state: &AppState) -> Result<(u64, bool), String> {
     let response = state
         .http
         .get(format!("{}/api/status", state.config.walletd_url.trim_end_matches('/')))
@@ -192,7 +209,13 @@ async fn node_tip_daa(state: &AppState) -> Result<u64, String> {
         return Err(format!("walletd status returned {}", response.status()));
     }
     let body: Value = response.json().await.map_err(|error| error.to_string())?;
-    body.get("daa_score").and_then(Value::as_u64).ok_or_else(|| "walletd status missing daa_score".to_string())
+    let tip = body.get("daa_score").and_then(Value::as_u64).ok_or_else(|| "walletd status missing daa_score".to_string())?;
+    if tip == 0 {
+        return Err("walletd reports no tip yet".to_string());
+    }
+    let synced = body.get("synced").and_then(Value::as_bool).unwrap_or(false)
+        && !body.get("loading").and_then(Value::as_bool).unwrap_or(true);
+    Ok((tip, synced))
 }
 
 async fn poll_wallet(state: &AppState) -> Result<(), String> {
@@ -200,7 +223,7 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
     // instantly (the old code fabricated `daa + 10_000` / `u64::MAX` as the
     // sink), so a merchant would treat a 0-conf payment as final. On a failed
     // fetch we skip this cycle rather than over-confirm.
-    let tip_daa = node_tip_daa(state).await?;
+    let (tip_daa, wallet_synced) = node_tip_daa(state).await?;
     // This fast path is additive. A temporary endpoint failure must never stop
     // the settled-history path that has always been the final source of truth.
     let pending_body: Value = match state
@@ -238,6 +261,8 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
     }
     let body: Value = response.json().await.map_err(|error| error.to_string())?;
     let mut events = Vec::new();
+    // Every txid this cycle actually saw on chain, for the reorg reconciliation below.
+    let mut seen_txids: HashSet<[u8; 32]> = HashSet::new();
     {
         let mut gateway = state.gateway.lock().map_err(|_| "state lock poisoned")?;
         // Near-tip receipts are already decrypted from selected-chain blocks but
@@ -245,13 +270,6 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
         // Require ten DAA of continuous chain inclusion before observing them;
         // a receipt reorged out before then simply disappears and is never credited.
         for row in pending_body.get("rows").and_then(Value::as_array).into_iter().flatten() {
-            let Some(daa) = row.get("daaScore").and_then(Value::as_u64) else { continue };
-            if tip_daa.saturating_sub(daa) < 10 {
-                continue;
-            }
-            let Some(recipient) = row.get("recipient").and_then(Value::as_str) else { continue };
-            let Ok(address) = Address::try_from(recipient) else { continue };
-            let Ok(raw) = <[u8; 43]>::try_from(address.payload.as_slice()) else { continue };
             let Some(txid) = row
                 .get("txid")
                 .and_then(Value::as_str)
@@ -260,6 +278,15 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
             else {
                 continue;
             };
+            // Still on chain, so it must not be retracted below even while it is too shallow to credit.
+            seen_txids.insert(txid);
+            let Some(daa) = row.get("daaScore").and_then(Value::as_u64) else { continue };
+            if tip_daa.saturating_sub(daa) < 10 {
+                continue;
+            }
+            let Some(recipient) = row.get("recipient").and_then(Value::as_str) else { continue };
+            let Ok(address) = Address::try_from(recipient) else { continue };
+            let Ok(raw) = <[u8; 43]>::try_from(address.payload.as_slice()) else { continue };
             let Some(amount) = row.get("amountSompiExact").and_then(Value::as_str).and_then(|v| v.parse().ok()) else { continue };
             if amount == 0 {
                 continue;
@@ -285,11 +312,35 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
                 .and_then(|v| v.parse().ok())
                 .or_else(|| row.get("amountSompi").and_then(Value::as_u64))
                 .unwrap_or(0);
+            // The row is on chain, so record it for reconciliation even if the depth below is
+            // unreadable — otherwise this cycle would retract a payment that never went away.
+            seen_txids.insert(txid);
+            // A zero-value record would burn the dedupe slot for the real payment.
             if amount == 0 {
                 continue;
             }
-            let daa = row.get("daaScore").and_then(Value::as_u64).unwrap_or(0);
+            // A missing or non-numeric score must SKIP the row, never default to 0: at 0 the depth
+            // test `tip - 0 >= required` is trivially true and the payment confirms instantly.
+            // walletd emits this as a u64 today, but it already serialises other amounts as
+            // strings for JS precision (`amountSompiExact`), so one such change here would
+            // silently confirm every invoice. Fail closed, exactly as the tip fetch does.
+            let Some(daa) = row.get("daaScore").and_then(Value::as_u64) else {
+                eprintln!("gateway: history row {} has no numeric daaScore; skipping", hex::encode(txid));
+                continue;
+            };
             if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, now()) {
+                events.push(event);
+            }
+        }
+        // Withdraw shallow payments the chain no longer shows (reorg / double-spend) BEFORE
+        // re-evaluating, so `advance` recomputes against corrected totals rather than a credit
+        // that has gone away.
+        // Only judge absence against a complete view: while walletd rescans or reloads, its
+        // history is empty or partial with a 200 and would reverse real payments.
+        // A failed pending-receipts read is an incomplete view too: payments credited from it
+        // would look absent and be reversed.
+        if wallet_synced && !pending_body.is_null() {
+            for event in gateway.retract_absent_shallow(&seen_txids, tip_daa, now()) {
                 events.push(event);
             }
         }
