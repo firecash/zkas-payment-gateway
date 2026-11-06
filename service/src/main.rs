@@ -331,15 +331,17 @@ async fn poll_wallet(state: &AppState) -> Result<(), String> {
             if tip_daa.saturating_sub(daa) < 10 {
                 continue;
             }
-            let Some(recipient) = row.get("recipient").and_then(Value::as_str) else { continue };
-            let Ok(address) = Address::try_from(recipient) else { continue };
-            let Ok(raw) = <[u8; 43]>::try_from(address.payload.as_slice()) else { continue };
-            let Some(amount) = row.get("amountSompiExact").and_then(Value::as_str).and_then(|v| v.parse().ok()) else { continue };
-            if amount == 0 {
-                continue;
-            }
-            if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, paid_at(row)) {
-                events.push(event);
+            // Per output, as for settled rows below: a near-tip row that put a two-invoice
+            // payment on one address would keep it there (the dedupe is per transaction and
+            // invoice), and the settled row could only add the other invoice's part.
+            let Some(parts) = row_payments(row) else { continue };
+            for (raw, amount) in parts {
+                if amount == 0 {
+                    continue;
+                }
+                if let Ok(Some(event)) = gateway.observe_payment(raw, txid, amount, daa, daa, tip_daa, paid_at(row)) {
+                    events.push(event);
+                }
             }
         }
         for row in body.get("rows").and_then(Value::as_array).into_iter().flatten() {
