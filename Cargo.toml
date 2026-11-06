@@ -2,11 +2,14 @@
 resolver = "2"
 members = ["core", "service"]
 
-# Standalone home of the ZKas merchant payment gateway. The two crates that come
-# from the node workspace — `kaspa-addresses` (address encoding, runtime) and
-# `kaspa-shielded-core` (FVK helpers, tests only) — are pulled as git
-# dependencies on firecash-rusty so this repo can never drift from the chain's
-# address/keys format. Everything else is crates.io.
+# Standalone home of the ZKas merchant payment gateway. `kaspa-addresses` (address
+# encoding) comes from the node repository as a git dependency, so this repo can never
+# drift from the chain's address format. Everything else is crates.io.
+#
+# Not `kaspa-shielded-core`: it builds only inside the node workspace, which patches
+# `zakura-orchard` by path, and a [patch] does not reach a git dependency. Tests derive
+# the viewing key with `orchard` directly. The URL must end in `.git`: without it
+# zkas.info redirects to the web page, which cargo cannot clone.
 [workspace.package]
 version = "2.0.1"
 edition = "2024"
@@ -22,8 +25,7 @@ uninlined_format_args = "allow"
 [workspace.dependencies]
 # Intra-chain crates, pinned to firecash-rusty so the gateway shares the exact
 # address/keys encoding the node and wallet use.
-kaspa-addresses = { git = "https://zkas.info/code/rusty", branch = "main" }
-kaspa-shielded-core = { git = "https://zkas.info/code/rusty", branch = "main" }
+kaspa-addresses = { git = "https://zkas.info/code/rusty.git", branch = "main" }
 
 # Local member.
 zkas-payment-gateway = { version = "2.0.1", path = "core" }

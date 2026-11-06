@@ -1,6 +1,12 @@
 use std::env;
 
-use kaspa_shielded_core::message::fvk_bytes_from_seed;
+use orchard::keys::{FullViewingKey, SpendingKey};
+
+/// The wallet's viewing key for a seed, exactly as the node derives it.
+fn fvk_bytes_from_seed(seed: [u8; 32]) -> Option<[u8; 96]> {
+    let sk = Option::<SpendingKey>::from(SpendingKey::from_bytes(seed))?;
+    Some(FullViewingKey::from(&sk).to_bytes())
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seed_hex = env::args().nth(1).ok_or("usage: derive_merchant <32-byte-seed-hex>")?;

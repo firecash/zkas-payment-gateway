@@ -1453,7 +1453,7 @@ dependencies = [
 [[package]]
 name = "kaspa-addresses"
 version = "2.0.1"
-source = "git+https://gitlab.com/zkas-group/zkas-rusty?branch=main#d8a5a661aa9570c227d0499eab74654a644c0f04"
+source = "git+https://zkas.info/code/rusty.git?branch=main#f490dee299f75a85120df9fd3dc11894ac2c5f9a"
 dependencies = [
  "borsh",
  "js-sys",
@@ -1463,22 +1463,6 @@ dependencies = [
  "wasm-bindgen",
  "workflow-log",
  "workflow-wasm",
-]
-
-[[package]]
-name = "kaspa-shielded-core"
-version = "2.0.1"
-source = "git+https://gitlab.com/zkas-group/zkas-rusty?branch=main#d8a5a661aa9570c227d0499eab74654a644c0f04"
-dependencies = [
- "blake2b_simd",
- "group",
- "incrementalmerkletree",
- "kaspa-addresses",
- "orchard",
- "pasta_curves",
- "rand 0.8.7",
- "serde",
- "zcash_note_encryption",
 ]
 
 [[package]]
@@ -3489,7 +3473,6 @@ dependencies = [
  "hex",
  "hmac",
  "kaspa-addresses",
- "kaspa-shielded-core",
  "orchard",
  "rand 0.8.7",
  "serde",
